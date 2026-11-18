@@ -1,9 +1,11 @@
 #include "mem_alloc.h"
 #include "managed_mem.h"
 #include <acl/acl.h>
+#include <atomic>
 #include <cstdlib> // for std::getenv
 #include <cstring> // for strerror
 #include <errno.h>
+#include <iostream>
 #include <numaif.h>
 #include <string>
 #include <sys/mman.h>
@@ -24,10 +26,22 @@ uintptr_t alloc_pinned_ptr(std::size_t size, unsigned int flags) {
   if (socVersion == nullptr ||
       std::string(socVersion).find("310") == std::string::npos) {
     // not 310p
-    auto devPtr = register_ptr(ptr, size);
-    if (devPtr == nullptr) {
-      free_pinned_ptr(reinterpret_cast<uintptr_t>(ptr));
-      throw std::runtime_error("register ptr failed");
+    // Host-register is a hard dependency of the zero-copy transfer path,
+    // but it is unsupported on some drivers (e.g. 24.1.rc3 returns
+    // 65534 from halHostRegister and 507899 from aclrtHostRegister).
+    // Auto-detect once: if the first registration fails, fall back to
+    // unregistered pinned memory; the connector must then use HBM
+    // staging transfers instead of zero-copy kernels.
+    static std::atomic<bool> register_supported{true};
+    if (register_supported.load()) {
+      auto devPtr = register_ptr(ptr, size);
+      if (devPtr == nullptr) {
+        register_supported.store(false);
+        std::cerr << "LMCache-Ascend: host-register unsupported by driver, "
+                     "falling back to unregistered pinned memory "
+                     "(HBM staging transfer path required)."
+                  << std::endl;
+      }
     }
   }
 
@@ -65,18 +79,18 @@ uintptr_t alloc_pinned_numa_ptr(std::size_t size, int node) {
   memset(ptr, 0, size);
 
   // as before we need to actually save the dev ptr for later reuse,
-  // because acl APIs do not allow retrieving register dev ptr
-  auto devPtr = register_ptr(ptr, size);
-  if (devPtr == nullptr) {
-    munmap(ptr, size);
-    aclError err = aclrtGetLastError(aclrtLastErrLevel::ACL_RT_THREAD_LEVEL);
-    if (err != ACL_SUCCESS) {
-      throw std::runtime_error(
-          std::string("unable to register Pinned Numa HostPtr: ") +
-          std::to_string(err));
-    } else {
-      throw std::runtime_error(
-          std::string("unable to register Pinned Numa HostPtr."));
+  // because acl APIs do not allow retrieving register dev ptr.
+  // Same auto-detect fallback as alloc_pinned_ptr: tolerate drivers
+  // without host-register support (see alloc_pinned_ptr).
+  static std::atomic<bool> numa_register_supported{true};
+  if (numa_register_supported.load()) {
+    auto devPtr = register_ptr(ptr, size);
+    if (devPtr == nullptr) {
+      numa_register_supported.store(false);
+      std::cerr << "LMCache-Ascend: host-register unsupported by driver, "
+                   "falling back to unregistered NUMA host memory "
+                   "(HBM staging transfer path required)."
+                << std::endl;
     }
   }
 

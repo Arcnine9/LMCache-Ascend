@@ -436,6 +436,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         # Initialize kv_format before calling super().__init__
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
 
+        # Reusable HBM staging buffers for the no-host-register transfer
+        # path, keyed by (shape, dtype) of the CPU memory object.
+        self._staging_buffers = {}
+
         # Initialize MLA/DSA parameters
         self.kv_lora_rank: int = 0
         self.qk_rope_head_dim: int = 0
@@ -769,8 +773,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
+        # HBM staging path: the zero-copy kernel requires host-register,
+        # which is unsupported on some drivers (e.g. 24.1.rc3). Stage the
+        # host buffer through HBM instead: copy_ (aclrtMemcpy under the
+        # hood, no host-register needed) + on-device gather/scatter kernel.
+        staging = self._get_staging_buffer(memory_obj.tensor)
+        staging.copy_(memory_obj.tensor, non_blocking=True)
         lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
+            staging,
             kv_cache_pointers,
             slot_mapping[start:end],
             self.kvcaches_device,
@@ -782,6 +792,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             self.qk_rope_head_dim,
             self.dsa_head_dim,
         )
+
+    def _get_staging_buffer(self, ref_tensor: torch.Tensor) -> torch.Tensor:
+        key = (tuple(ref_tensor.shape), ref_tensor.dtype)
+        buf = self._staging_buffers.get(key)
+        if buf is None:
+            buf = torch.empty(
+                ref_tensor.shape,
+                dtype=ref_tensor.dtype,
+                device=self.kvcaches_device,
+            )
+            self._staging_buffers[key] = buf
+        return buf
 
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -818,38 +840,24 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             raise ValueError("KV cache format is not initialized!")
 
         with torch.cuda.stream(self.store_stream):
-            # No staging buffer or token count mismatch
-            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-                lmc_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
-                    kv_cache_pointers,
-                    slot_mapping[start:end],
-                    self.kvcaches_device,
-                    self.page_buffer_size,
-                    True,
-                    self.use_mla,
-                    self.kv_format.value,
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                    self.dsa_head_dim,
-                )
-            else:
-                assert self.gpu_buffer.device == self.kvcaches_device
-                tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-                lmc_ops.fused_multi_layer_kv_transfer(
-                    memory_obj.tensor,  # dst: CPU buffer
-                    tmp_gpu_buffer,  # staging cache
-                    kv_cache_pointers,  # src: paged KV cache
-                    slot_mapping[start:end],
-                    self.kvcaches_device,
-                    self.page_buffer_size,
-                    True,  # from_gpu
-                    self.use_mla,
-                    self.kv_format.value,
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                    self.dsa_head_dim,
-                )
+            # HBM staging path (see to_gpu): gather paged KV into an HBM
+            # staging buffer with the on-device kernel, then copy_ back
+            # to the host buffer. No host-register required.
+            staging = self._get_staging_buffer(memory_obj.tensor)
+            lmc_ops.multi_layer_kv_transfer(
+                staging,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.kvcaches_device,
+                self.page_buffer_size,
+                True,
+                self.use_mla,
+                self.kv_format.value,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.dsa_head_dim,
+            )
+            memory_obj.tensor.copy_(staging, non_blocking=True)
 
         if not memory_obj.tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device
